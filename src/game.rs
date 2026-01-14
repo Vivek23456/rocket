@@ -33,6 +33,29 @@ struct Obstacle {
     glow_phase: f32,
 }
 
+// Bullet projectile
+struct Bullet {
+    pos: Vec2,
+    velocity: Vec2,
+    life: f32,
+}
+
+// Enemy rocket
+struct Enemy {
+    pos: Vec2,
+    velocity: Vec2,
+    rotation: f32,
+    health: i32,
+    size: f32,
+}
+
+// Explosion effect
+struct Explosion {
+    pos: Vec2,
+    life: f32,
+    size: f32,
+}
+
 pub struct GameState {
     left_joystick: Joystick,
     right_joystick: Joystick,
@@ -45,12 +68,21 @@ pub struct GameState {
     trail: Vec<TrailSegment>,
     obstacles: Vec<Obstacle>,
     
+    // Combat
+    bullets: Vec<Bullet>,
+    enemies: Vec<Enemy>,
+    explosions: Vec<Explosion>,
+    shoot_cooldown: f32,
+    enemy_spawn_timer: f32,
+    
     // Game state
     health: i32,
+    score: i32,
     time: f32,
     intro_alpha: f32,
     game_started: bool,
     safe_time: f32,
+    game_over: bool,
 }
 
 impl GameState {
@@ -97,11 +129,18 @@ impl GameState {
             particles,
             trail: Vec::new(),
             obstacles,
+            bullets: Vec::new(),
+            enemies: Vec::new(),
+            explosions: Vec::new(),
+            shoot_cooldown: 0.0,
+            enemy_spawn_timer: 0.0,
             health: 3,
+            score: 0,
             time: 0.0,
             intro_alpha: 1.0,
             game_started: false,
             safe_time: 3.0,
+            game_over: false,
         }
     }
 
@@ -130,6 +169,13 @@ impl GameState {
 
         // Update player
         self.player.update(movement, aim, dt);
+
+        // Shooting mechanic - auto-fire when aiming
+        self.shoot_cooldown -= dt;
+        if self.right_joystick.active && self.shoot_cooldown <= 0.0 {
+            self.shoot();
+            self.shoot_cooldown = 0.15; // Fire rate
+        }
 
         // Add trail segment
         let player_pos = to_mac_vec2(self.player.position);
@@ -161,6 +207,108 @@ impl GameState {
         if pos.y > screen_height() { pos.y = 0.0; }
         self.player.position = pos;
         
+        // Update bullets
+        self.bullets.retain_mut(|bullet| {
+            bullet.pos += bullet.velocity * dt;
+            bullet.life -= dt;
+            
+            // Remove bullets off screen or expired
+            bullet.life > 0.0 
+                && bullet.pos.x > 0.0 && bullet.pos.x < screen_width()
+                && bullet.pos.y > 0.0 && bullet.pos.y < screen_height()
+        });
+        
+        // Spawn enemies
+        if self.safe_time <= 0.0 {
+            self.enemy_spawn_timer -= dt;
+            if self.enemy_spawn_timer <= 0.0 {
+                self.spawn_enemy();
+                self.enemy_spawn_timer = rand::gen_range(1.0, 2.5); // Spawn every 1-2.5 seconds
+            }
+        }
+        
+        // Update enemies - they chase the player!
+        for enemy in &mut self.enemies {
+            let player_pos = to_mac_vec2(self.player.position);
+            let to_player = player_pos - enemy.pos;
+            let distance = to_player.length();
+            
+            if distance > 0.0 {
+                // Chase player
+                let direction = to_player / distance;
+                enemy.velocity = direction * 150.0; // Enemy speed
+                enemy.rotation = direction.y.atan2(direction.x);
+            }
+            
+            enemy.pos += enemy.velocity * dt;
+            
+            // Wrap enemies around screen
+            if enemy.pos.x < -50.0 { enemy.pos.x = screen_width() + 50.0; }
+            if enemy.pos.x > screen_width() + 50.0 { enemy.pos.x = -50.0; }
+            if enemy.pos.y < -50.0 { enemy.pos.y = screen_height() + 50.0; }
+            if enemy.pos.y > screen_height() + 50.0 { enemy.pos.y = -50.0; }
+        }
+        
+        // Check bullet vs enemy collisions
+        let mut enemies_to_remove = Vec::new();
+        for (i, enemy) in self.enemies.iter_mut().enumerate() {
+            for bullet in &mut self.bullets {
+                let dist = (bullet.pos - enemy.pos).length();
+                if dist < enemy.size + 10.0 {
+                    enemy.health -= 1;
+                    bullet.life = 0.0; // Remove bullet
+                    
+                    if enemy.health <= 0 {
+                        enemies_to_remove.push(i);
+                        self.score += 100;
+                        self.explosions.push(Explosion {
+                            pos: enemy.pos,
+                            life: 0.5,
+                            size: enemy.size * 2.0,
+                        });
+                    }
+                }
+            }
+        }
+        
+        // Remove dead enemies
+        for &i in enemies_to_remove.iter().rev() {
+            self.enemies.remove(i);
+        }
+        
+        // Check player vs enemy collisions
+        if self.safe_time <= 0.0 {
+            let player_pos = to_mac_vec2(self.player.position);
+            let mut collision_index = None;
+            
+            for (i, enemy) in self.enemies.iter().enumerate() {
+                let dist = (player_pos - enemy.pos).length();
+                if dist < 40.0 + enemy.size {
+                    collision_index = Some((i, enemy.pos, enemy.size));
+                    break;
+                }
+            }
+            
+            if let Some((idx, pos, size)) = collision_index {
+                self.enemies.remove(idx);
+                self.explosions.push(Explosion {
+                    pos,
+                    life: 0.5,
+                    size: size * 2.0,
+                });
+                self.health -= 1;
+                // Flash effect
+                self.safe_time = 0.3; // Brief invulnerability
+            }
+        }
+        
+        // Update explosions
+        self.explosions.retain_mut(|exp| {
+            exp.life -= dt * 2.0;
+            exp.size += dt * 100.0;
+            exp.life > 0.0
+        });
+        
         // Update particles (breathing world)
         for particle in &mut self.particles {
             particle.pos += particle.velocity * dt;
@@ -180,16 +328,55 @@ impl GameState {
             obstacle.glow_phase += dt * 2.0;
         }
         
-        // Check collision with obstacles (only after safe time)
-        if self.safe_time <= 0.0 {
-            let player_pos = to_mac_vec2(self.player.position);
-            for obstacle in &self.obstacles {
-                let dist = (player_pos - obstacle.pos).length();
-                if dist < obstacle.size + 20.0 {
-                    // TODO: Handle collision (flash, lose health, etc.)
-                }
-            }
+        // Game over
+        if self.health <= 0 {
+            // TODO: Game over screen
         }
+    }
+    
+    fn shoot(&mut self) {
+        let player_pos = to_mac_vec2(self.player.position);
+        let rotation = self.player.rotation;
+        
+        // Bullet starts from front of ship
+        let bullet_start = Vec2::new(
+            player_pos.x + rotation.cos() * 45.0,
+            player_pos.y + rotation.sin() * 45.0,
+        );
+        
+        // Bullet velocity
+        let bullet_velocity = Vec2::new(
+            rotation.cos() * 600.0,
+            rotation.sin() * 600.0,
+        );
+        
+        self.bullets.push(Bullet {
+            pos: bullet_start,
+            velocity: bullet_velocity,
+            life: 2.0,
+        });
+    }
+    
+    fn spawn_enemy(&mut self) {
+        let screen_width = screen_width();
+        let screen_height = screen_height();
+        
+        // Spawn from edges
+        let side = rand::gen_range(0, 4);
+        let pos = match side {
+            0 => Vec2::new(rand::gen_range(0.0, screen_width), -50.0), // Top
+            1 => Vec2::new(rand::gen_range(0.0, screen_width), screen_height + 50.0), // Bottom
+            2 => Vec2::new(-50.0, rand::gen_range(0.0, screen_height)), // Left
+            _ => Vec2::new(screen_width + 50.0, rand::gen_range(0.0, screen_height)), // Right
+        };
+        
+        self.enemies.push(Enemy {
+            pos,
+            velocity: Vec2::new(0.0, 0.0),
+            rotation: 0.0,
+            health: 2,
+            size: 25.0,
+        });
     }
 
     fn handle_input(&mut self) {
@@ -302,7 +489,7 @@ impl GameState {
         }
 
         // Draw player trail
-        for (i, seg) in self.trail.iter().enumerate() {
+        for seg in self.trail.iter() {
             let alpha = (seg.life * 100.0) as u8;
             let size = seg.size * seg.life;
             
@@ -320,6 +507,42 @@ impl GameState {
                 seg.pos.y,
                 size * 0.6,
                 Color::from_rgba(150, 220, 255, alpha / 2),
+            );
+        }
+        
+        // Draw bullets
+        for bullet in &self.bullets {
+            // Bullet glow
+            draw_circle(bullet.pos.x, bullet.pos.y, 8.0, Color::from_rgba(100, 255, 200, 150));
+            draw_circle(bullet.pos.x, bullet.pos.y, 5.0, Color::from_rgba(150, 255, 220, 255));
+            draw_circle(bullet.pos.x, bullet.pos.y, 2.0, Color::from_rgba(255, 255, 255, 255));
+        }
+        
+        // Draw enemies
+        for enemy in &self.enemies {
+            self.draw_enemy(enemy);
+        }
+        
+        // Draw explosions
+        for explosion in &self.explosions {
+            let alpha = (explosion.life * 255.0) as u8;
+            draw_circle(
+                explosion.pos.x,
+                explosion.pos.y,
+                explosion.size,
+                Color::from_rgba(255, 150, 50, alpha / 2),
+            );
+            draw_circle(
+                explosion.pos.x,
+                explosion.pos.y,
+                explosion.size * 0.7,
+                Color::from_rgba(255, 200, 100, alpha),
+            );
+            draw_circle(
+                explosion.pos.x,
+                explosion.pos.y,
+                explosion.size * 0.4,
+                Color::from_rgba(255, 255, 200, alpha),
             );
         }
 
@@ -348,6 +571,39 @@ impl GameState {
             );
         }
     }
+    
+    fn draw_enemy(&self, enemy: &Enemy) {
+        let pos = enemy.pos;
+        let rotation = enemy.rotation;
+        let size = enemy.size;
+        
+        // Enemy rocket - menacing red design
+        let front = Vec2::new(
+            pos.x + rotation.cos() * size,
+            pos.y + rotation.sin() * size,
+        );
+        
+        let left = Vec2::new(
+            pos.x + (rotation + 2.5).cos() * size * 0.6,
+            pos.y + (rotation + 2.5).sin() * size * 0.6,
+        );
+        
+        let right = Vec2::new(
+            pos.x + (rotation - 2.5).cos() * size * 0.6,
+            pos.y + (rotation - 2.5).sin() * size * 0.6,
+        );
+        
+        // Red glow
+        draw_circle(pos.x, pos.y, size + 15.0, Color::from_rgba(255, 50, 50, 40));
+        draw_circle(pos.x, pos.y, size + 8.0, Color::from_rgba(255, 80, 80, 80));
+        
+        // Body
+        draw_triangle(front, left, right, Color::from_rgba(255, 80, 80, 255));
+        draw_triangle_lines(front, left, right, 2.0, Color::from_rgba(255, 150, 150, 255));
+        
+        // Core
+        draw_circle(pos.x, pos.y, 4.0, Color::from_rgba(255, 200, 200, 255));
+    }
 
     fn draw_minimal_joystick(&self, joystick: &Joystick, color: Color) {
         let center = to_mac_vec2(joystick.center);
@@ -370,56 +626,158 @@ impl GameState {
         let pos = to_mac_vec2(self.player.position);
         let rotation = self.player.rotation;
 
-        // Player size - BIGGER
-        let size = 35.0;
+        // Flash if recently hit
+        let flash = if self.safe_time > 0.0 && self.safe_time < 0.3 {
+            ((self.safe_time * 30.0).sin() * 127.0 + 128.0) as u8
+        } else {
+            255
+        };
+
+        // Player size - BIGGER and more imposing
+        let size = 40.0;
         
-        // Calculate ship points
+        // Calculate ship points - sleeker design
         let front = Vec2::new(
             pos.x + rotation.cos() * size,
             pos.y + rotation.sin() * size,
         );
+        
+        // Main body wings
+        let left_wing = Vec2::new(
+            pos.x + (rotation + 2.3).cos() * size * 0.7,
+            pos.y + (rotation + 2.3).sin() * size * 0.7,
+        );
+        let right_wing = Vec2::new(
+            pos.x + (rotation - 2.3).cos() * size * 0.7,
+            pos.y + (rotation - 2.3).sin() * size * 0.7,
+        );
+        
+        // Back engine points
         let back_left = Vec2::new(
-            pos.x + (rotation + 2.5).cos() * size * 0.6,
-            pos.y + (rotation + 2.5).sin() * size * 0.6,
+            pos.x + (rotation + 2.8).cos() * size * 0.5,
+            pos.y + (rotation + 2.8).sin() * size * 0.5,
         );
         let back_right = Vec2::new(
-            pos.x + (rotation - 2.5).cos() * size * 0.6,
-            pos.y + (rotation - 2.5).sin() * size * 0.6,
+            pos.x + (rotation - 2.8).cos() * size * 0.5,
+            pos.y + (rotation - 2.8).sin() * size * 0.5,
+        );
+        let back_center = Vec2::new(
+            pos.x - rotation.cos() * size * 0.4,
+            pos.y - rotation.sin() * size * 0.4,
         );
 
-        // Outer glow
-        draw_circle(pos.x, pos.y, size + 20.0, Color::from_rgba(100, 200, 255, 30));
-        draw_circle(pos.x, pos.y, size + 10.0, Color::from_rgba(120, 220, 255, 60));
+        // Massive outer glow - makes it feel powerful
+        draw_circle(pos.x, pos.y, size + 30.0, Color::from_rgba(80, 180, 255, 20));
+        draw_circle(pos.x, pos.y, size + 20.0, Color::from_rgba(100, 200, 255, 40));
+        draw_circle(pos.x, pos.y, size + 10.0, Color::from_rgba(120, 220, 255, 70));
         
-        // Ship body with glow
-        draw_triangle(front, back_left, back_right, Color::from_rgba(150, 220, 255, 255));
-        draw_triangle_lines(front, back_left, back_right, 3.0, Color::from_rgba(200, 240, 255, 255));
-
-        // Engine glow
+        // Engine flames FIRST (so they're behind ship)
         let movement = self.left_joystick.get_input();
         if movement.x.abs() > 0.1 || movement.y.abs() > 0.1 {
             let thrust_power = (movement.x * movement.x + movement.y * movement.y).sqrt();
-            let flame_pos = Vec2::new(
-                pos.x - rotation.cos() * size * 0.5,
-                pos.y - rotation.sin() * size * 0.5,
-            );
-            let flame_size = thrust_power * 25.0;
+            let flame_length = thrust_power * 35.0;
+            let pulse = (self.time * 15.0).sin() * 0.2 + 0.8;
             
-            // Outer flame
-            draw_circle(flame_pos.x, flame_pos.y, flame_size, Color::from_rgba(255, 150, 50, 150));
-            // Inner flame
-            draw_circle(flame_pos.x, flame_pos.y, flame_size * 0.6, Color::from_rgba(255, 200, 100, 200));
-            // Core
-            draw_circle(flame_pos.x, flame_pos.y, flame_size * 0.3, Color::from_rgba(255, 255, 200, 255));
+            // Left engine flame
+            let flame_left = Vec2::new(
+                back_left.x - rotation.cos() * 10.0,
+                back_left.y - rotation.sin() * 10.0,
+            );
+            self.draw_engine_flame(flame_left, rotation, flame_length * pulse, thrust_power);
+            
+            // Right engine flame
+            let flame_right = Vec2::new(
+                back_right.x - rotation.cos() * 10.0,
+                back_right.y - rotation.sin() * 10.0,
+            );
+            self.draw_engine_flame(flame_right, rotation, flame_length * pulse * 0.95, thrust_power);
+            
+            // Center engine flame (main thrust)
+            let flame_center = Vec2::new(
+                back_center.x - rotation.cos() * 5.0,
+                back_center.y - rotation.sin() * 5.0,
+            );
+            self.draw_engine_flame(flame_center, rotation, flame_length * pulse * 1.2, thrust_power);
         }
         
-        // Core dot
-        draw_circle(pos.x, pos.y, 4.0, Color::from_rgba(255, 255, 255, 255));
+        // Ship shadow/depth layer (darker)
+        draw_triangle(front, left_wing, back_left, Color::from_rgba(60, 120, 180, flash));
+        draw_triangle(front, right_wing, back_right, Color::from_rgba(60, 120, 180, flash));
+        
+        // Main ship body (brighter)
+        draw_triangle(front, left_wing, right_wing, Color::from_rgba(140, 210, 255, flash));
+        draw_triangle(left_wing, right_wing, back_center, Color::from_rgba(120, 190, 240, flash));
+        
+        // Cockpit window (glowing)
+        let cockpit = Vec2::new(
+            pos.x + rotation.cos() * size * 0.5,
+            pos.y + rotation.sin() * size * 0.5,
+        );
+        draw_circle(cockpit.x, cockpit.y, 6.0, Color::from_rgba(100, 220, 255, 180));
+        draw_circle(cockpit.x, cockpit.y, 4.0, Color::from_rgba(180, 240, 255, flash));
+        
+        // Wing edges (sharp glowing lines)
+        draw_line(front.x, front.y, left_wing.x, left_wing.y, 3.0, Color::from_rgba(200, 240, 255, flash));
+        draw_line(front.x, front.y, right_wing.x, right_wing.y, 3.0, Color::from_rgba(200, 240, 255, flash));
+        draw_line(left_wing.x, left_wing.y, back_left.x, back_left.y, 2.0, Color::from_rgba(180, 230, 255, flash));
+        draw_line(right_wing.x, right_wing.y, back_right.x, back_right.y, 2.0, Color::from_rgba(180, 230, 255, flash));
+        
+        // Energy lines on wings (detail)
+        let wing_line_left = Vec2::new(
+            pos.x + (rotation + 2.0).cos() * size * 0.5,
+            pos.y + (rotation + 2.0).sin() * size * 0.5,
+        );
+        let wing_line_right = Vec2::new(
+            pos.x + (rotation - 2.0).cos() * size * 0.5,
+            pos.y + (rotation - 2.0).sin() * size * 0.5,
+        );
+        draw_line(pos.x, pos.y, wing_line_left.x, wing_line_left.y, 2.0, Color::from_rgba(100, 200, 255, 150));
+        draw_line(pos.x, pos.y, wing_line_right.x, wing_line_right.y, 2.0, Color::from_rgba(100, 200, 255, 150));
+        
+        // Nose tip (bright point)
+        draw_circle(front.x, front.y, 4.0, Color::from_rgba(255, 255, 255, flash));
+        draw_circle(front.x, front.y, 2.0, Color::from_rgba(180, 240, 255, flash));
+        
+        // Core center glow
+        draw_circle(pos.x, pos.y, 5.0, Color::from_rgba(200, 240, 255, 200));
+    }
+    
+    fn draw_engine_flame(&self, pos: Vec2, rotation: f32, length: f32, power: f32) {
+        let flame_back = Vec2::new(
+            pos.x - rotation.cos() * length,
+            pos.y - rotation.sin() * length,
+        );
+        
+        // Outer flame (orange glow)
+        let points_outer = 8;
+        for i in 0..points_outer {
+            let angle = rotation + (i as f32 / points_outer as f32) * std::f32::consts::PI * 0.5 - std::f32::consts::PI * 0.25;
+            let flame_point = Vec2::new(
+                flame_back.x + angle.cos() * length * 0.4,
+                flame_back.y + angle.sin() * length * 0.4,
+            );
+            draw_triangle(
+                pos,
+                flame_back,
+                flame_point,
+                Color::from_rgba(255, 100, 30, (power * 100.0) as u8),
+            );
+        }
+        
+        // Middle flame (yellow)
+        draw_line(pos.x, pos.y, flame_back.x, flame_back.y, length * 0.3, Color::from_rgba(255, 180, 50, (power * 200.0) as u8));
+        
+        // Inner flame (bright white core)
+        draw_line(pos.x, pos.y, flame_back.x, flame_back.y, length * 0.15, Color::from_rgba(255, 255, 200, (power * 255.0) as u8));
+        
+        // Flame tip glow
+        draw_circle(flame_back.x, flame_back.y, length * 0.2, Color::from_rgba(255, 150, 50, (power * 80.0) as u8));
+        draw_circle(flame_back.x, flame_back.y, length * 0.1, Color::from_rgba(255, 220, 100, (power * 150.0) as u8));
     }
     
     fn draw_ui(&self) {
         // Top-left: Hearts
-        for i in 0..self.health {
+        for i in 0..self.health.max(0) {
             let x = 30.0 + (i as f32 * 40.0);
             let y = 30.0;
             
@@ -429,12 +787,24 @@ impl GameState {
             draw_circle(x, y + 8.0, 8.0, Color::from_rgba(255, 100, 120, 255));
         }
         
+        // Top-center: Score
+        let score_text = format!("SCORE: {}", self.score);
+        let font_size = 30.0;
+        let score_width = measure_text(&score_text, None, font_size as u16, 1.0).width;
+        
+        draw_text(
+            &score_text,
+            (screen_width() - score_width) / 2.0,
+            40.0,
+            font_size,
+            Color::from_rgba(100, 255, 150, 255),
+        );
+        
         // Top-right: Timer
         let minutes = (self.time / 60.0) as i32;
         let seconds = (self.time % 60.0) as i32;
         let time_text = format!("{:02}:{:02}", minutes, seconds);
         
-        let font_size = 30.0;
         let text_width = measure_text(&time_text, None, font_size as u16, 1.0).width;
         
         draw_text(
@@ -446,7 +816,7 @@ impl GameState {
         );
         
         // Safe period indicator
-        if self.safe_time > 0.0 {
+        if self.safe_time > 0.0 && self.game_started {
             let safe_text = "Safe Zone";
             let safe_width = measure_text(safe_text, None, 25 as u16, 1.0).width;
             let alpha = ((self.safe_time * 3.0).sin() * 127.0 + 128.0) as u8;
@@ -457,6 +827,21 @@ impl GameState {
                 screen_height() / 2.0 - 100.0,
                 25.0,
                 Color::from_rgba(100, 255, 150, alpha),
+            );
+        }
+        
+        // Game instructions hint
+        if self.time < 5.0 {
+            let hint = "Right joystick to AIM & SHOOT!";
+            let hint_width = measure_text(hint, None, 20 as u16, 1.0).width;
+            let alpha = ((self.time * 2.0).sin() * 127.0 + 128.0) as u8;
+            
+            draw_text(
+                hint,
+                (screen_width() - hint_width) / 2.0,
+                screen_height() - 80.0,
+                20.0,
+                Color::from_rgba(255, 200, 100, alpha),
             );
         }
     }
