@@ -107,18 +107,8 @@ impl GameState {
             });
         }
         
-        // Create some obstacles
-        let mut obstacles = Vec::new();
-        for i in 0..5 {
-            obstacles.push(Obstacle {
-                pos: Vec2::new(
-                    screen_width * 0.3 + (i as f32 * 150.0),
-                    screen_height * 0.5 + (i as f32 * 50.0).sin() * 100.0,
-                ),
-                size: 40.0,
-                glow_phase: rand::gen_range(0.0, 6.28),
-            });
-        }
+        // No obstacles - clean space
+        let obstacles = Vec::new();
         
         Self {
             left_joystick: Joystick::new(80.0),
@@ -145,6 +135,14 @@ impl GameState {
     }
 
     pub fn update(&mut self, dt: f32) {
+        // Check for restart on game over
+        if self.game_over {
+            if is_key_pressed(KeyCode::Space) || is_mouse_button_pressed(MouseButton::Left) {
+                *self = GameState::new();
+            }
+            return;
+        }
+        
         self.time += dt;
         
         // Fade in intro
@@ -296,9 +294,17 @@ impl GameState {
                     life: 0.5,
                     size: size * 2.0,
                 });
-                self.health -= 1;
-                // Flash effect
-                self.safe_time = 0.3; // Brief invulnerability
+                
+                // GAME OVER on collision!
+                self.game_over = true;
+                
+                // Also create explosion at player position
+                let player_pos = to_mac_vec2(self.player.position);
+                self.explosions.push(Explosion {
+                    pos: player_pos,
+                    life: 1.0,
+                    size: 80.0,
+                });
             }
         }
         
@@ -323,15 +329,7 @@ impl GameState {
             particle.alpha = 0.2 + (self.time * 2.0 + particle.pos.x * 0.01).sin() * 0.1;
         }
         
-        // Update obstacles
-        for obstacle in &mut self.obstacles {
-            obstacle.glow_phase += dt * 2.0;
-        }
-        
-        // Game over
-        if self.health <= 0 {
-            // TODO: Game over screen
-        }
+        // No obstacles to update
     }
     
     fn shoot(&mut self) {
@@ -459,34 +457,7 @@ impl GameState {
             );
         }
         
-        // Draw obstacles with glow
-        for obstacle in &self.obstacles {
-            let glow = (obstacle.glow_phase.sin() * 0.3 + 0.7).max(0.3);
-            
-            // Outer glow
-            draw_circle(
-                obstacle.pos.x,
-                obstacle.pos.y,
-                obstacle.size + 15.0,
-                Color::from_rgba(80, 40, 120, (glow * 40.0) as u8),
-            );
-            
-            // Main circle
-            draw_circle(
-                obstacle.pos.x,
-                obstacle.pos.y,
-                obstacle.size,
-                Color::from_rgba(140, 80, 200, (glow * 180.0) as u8),
-            );
-            
-            // Core
-            draw_circle(
-                obstacle.pos.x,
-                obstacle.pos.y,
-                obstacle.size * 0.4,
-                Color::from_rgba(200, 150, 255, (glow * 255.0) as u8),
-            );
-        }
+        // Obstacles removed for cleaner gameplay
 
         // Draw player trail
         for seg in self.trail.iter() {
@@ -546,14 +517,16 @@ impl GameState {
             );
         }
 
-        // Draw enhanced player
-        self.draw_player();
+        // Draw enhanced player (unless game over)
+        if !self.game_over {
+            self.draw_player();
+        }
 
         // Draw minimal joysticks (only when active, very transparent)
-        if self.left_joystick.active {
+        if self.left_joystick.active && !self.game_over {
             self.draw_minimal_joystick(&self.left_joystick, Color::from_rgba(100, 200, 255, 60));
         }
-        if self.right_joystick.active {
+        if self.right_joystick.active && !self.game_over {
             self.draw_minimal_joystick(&self.right_joystick, Color::from_rgba(255, 100, 100, 60));
         }
 
@@ -569,6 +542,11 @@ impl GameState {
                 screen_height(),
                 Color::from_rgba(5, 5, 15, (self.intro_alpha * 255.0) as u8),
             );
+        }
+        
+        // Game Over screen
+        if self.game_over {
+            self.draw_game_over();
         }
     }
     
@@ -776,17 +754,6 @@ impl GameState {
     }
     
     fn draw_ui(&self) {
-        // Top-left: Hearts
-        for i in 0..self.health.max(0) {
-            let x = 30.0 + (i as f32 * 40.0);
-            let y = 30.0;
-            
-            // Heart emoji effect (simple circles for now)
-            draw_circle(x - 5.0, y, 8.0, Color::from_rgba(255, 100, 120, 255));
-            draw_circle(x + 5.0, y, 8.0, Color::from_rgba(255, 100, 120, 255));
-            draw_circle(x, y + 8.0, 8.0, Color::from_rgba(255, 100, 120, 255));
-        }
-        
         // Top-center: Score
         let score_text = format!("SCORE: {}", self.score);
         let font_size = 30.0;
@@ -800,20 +767,38 @@ impl GameState {
             Color::from_rgba(100, 255, 150, 255),
         );
         
-        // Top-right: Timer
-        let minutes = (self.time / 60.0) as i32;
-        let seconds = (self.time % 60.0) as i32;
-        let time_text = format!("{:02}:{:02}", minutes, seconds);
-        
-        let text_width = measure_text(&time_text, None, font_size as u16, 1.0).width;
-        
-        draw_text(
-            &time_text,
-            screen_width() - text_width - 30.0,
-            40.0,
-            font_size,
-            Color::from_rgba(200, 220, 255, 200),
-        );
+        // Timer on player rocket (if not game over)
+        if !self.game_over {
+            let player_pos = to_mac_vec2(self.player.position);
+            let minutes = (self.time / 60.0) as i32;
+            let seconds = (self.time % 60.0) as i32;
+            let time_text = format!("{:02}:{:02}", minutes, seconds);
+            
+            let timer_font_size = 20.0;
+            let text_width = measure_text(&time_text, None, timer_font_size as u16, 1.0).width;
+            
+            // Draw timer above player rocket with background
+            let timer_x = player_pos.x - text_width / 2.0;
+            let timer_y = player_pos.y - 60.0;
+            
+            // Background box
+            draw_rectangle(
+                timer_x - 5.0,
+                timer_y - 20.0,
+                text_width + 10.0,
+                25.0,
+                Color::from_rgba(0, 0, 0, 150),
+            );
+            
+            // Timer text
+            draw_text(
+                &time_text,
+                timer_x,
+                timer_y,
+                timer_font_size,
+                Color::from_rgba(255, 255, 100, 255),
+            );
+        }
         
         // Safe period indicator
         if self.safe_time > 0.0 && self.game_started {
@@ -831,7 +816,7 @@ impl GameState {
         }
         
         // Game instructions hint
-        if self.time < 5.0 {
+        if self.time < 5.0 && !self.game_over {
             let hint = "Right joystick to AIM & SHOOT!";
             let hint_width = measure_text(hint, None, 20 as u16, 1.0).width;
             let alpha = ((self.time * 2.0).sin() * 127.0 + 128.0) as u8;
@@ -844,5 +829,71 @@ impl GameState {
                 Color::from_rgba(255, 200, 100, alpha),
             );
         }
+    }
+    
+    fn draw_game_over(&self) {
+        // Dark overlay
+        draw_rectangle(
+            0.0,
+            0.0,
+            screen_width(),
+            screen_height(),
+            Color::from_rgba(0, 0, 0, 180),
+        );
+        
+        // GAME OVER title
+        let game_over_text = "GAME OVER";
+        let title_size = 80.0;
+        let title_width = measure_text(game_over_text, None, title_size as u16, 1.0).width;
+        
+        draw_text(
+            game_over_text,
+            (screen_width() - title_width) / 2.0,
+            screen_height() / 2.0 - 80.0,
+            title_size,
+            Color::from_rgba(255, 80, 80, 255),
+        );
+        
+        // Final Score
+        let score_text = format!("FINAL SCORE: {}", self.score);
+        let score_size = 40.0;
+        let score_width = measure_text(&score_text, None, score_size as u16, 1.0).width;
+        
+        draw_text(
+            &score_text,
+            (screen_width() - score_width) / 2.0,
+            screen_height() / 2.0,
+            score_size,
+            Color::from_rgba(100, 255, 150, 255),
+        );
+        
+        // Survival Time
+        let minutes = (self.time / 60.0) as i32;
+        let seconds = (self.time % 60.0) as i32;
+        let time_text = format!("Survived: {:02}:{:02}", minutes, seconds);
+        let time_size = 30.0;
+        let time_width = measure_text(&time_text, None, time_size as u16, 1.0).width;
+        
+        draw_text(
+            &time_text,
+            (screen_width() - time_width) / 2.0,
+            screen_height() / 2.0 + 50.0,
+            time_size,
+            Color::from_rgba(200, 220, 255, 255),
+        );
+        
+        // Restart instruction
+        let restart_text = "Click or Press SPACE to Restart";
+        let restart_size = 25.0;
+        let restart_width = measure_text(restart_text, None, restart_size as u16, 1.0).width;
+        let pulse = ((self.time * 3.0).sin() * 127.0 + 128.0) as u8;
+        
+        draw_text(
+            restart_text,
+            (screen_width() - restart_width) / 2.0,
+            screen_height() / 2.0 + 120.0,
+            restart_size,
+            Color::from_rgba(255, 255, 100, pulse),
+        );
     }
 }
